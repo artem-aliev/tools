@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""dbless — interactive Parquet/CSV viewer using DuckDB (less-like).
+
+Usage:
+    dbless file.csv
+    dbless file.parquet
+    dbless output/*.csv
+    dbless -n 50 file.parquet
+
+Keys:
+    arrows / j k     scroll line by line
+    Space / PgDn     page down
+    b / PgUp         page up
+    g / Home         go to top
+    G / End          go to tail
+    /                search forward
+    ?                search backward (not implemented, use /)
+    n / N            next / previous match
+    .                enter SQL query (Enter to run, Esc to cancel)
+    Tab              switch to next file
+    h                show help
+    q                quit
+"""
+
+import argparse
+import curses
+import os
+import sys
+import duckdb
+
+
+TEXT_EXTENSIONS = {".txt", ".py", ".md", ".log", ".cfg", ".ini", ".yaml", ".yml", ".toml", ".xml", ".html", ".sql", ".sh", ".bat", ".rst", ".tex", ".css", ".js", ".ts"}
+JSON_EXTENSIONS = {".json", ".jsonl", ".ndjson", ".ipynb"}
+
+
+def _flatten_dict(d, parent_key="", sep="."):
+    """Flatten nested dict with dot-notation keys. Lists become '[N items]' strings."""
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, new_key, sep).items())
+        elif isinstance(v, list):
+            if v and all(isinstance(x, dict) for x in v):
+                items.append((new_key, f"[{len(v)} dicts]"))
+            elif v:
+                items.append((new_key, f"[{len(v)} items]"))
+            else:
+                items.append((new_key, "[]"))
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+def _collapse_str(s):
+    """Replace newlines with visible symbol, truncate long strings."""
+    if not isinstance(s, str):
+        return s
+    s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return s
+
+
+def load_json(con, path, view_name):
+    import json
+    import pandas as pd
+
+    with open(path) as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            # Try JSONL — read line by line
+            f.seek(0)
+            records = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+            if not records:
+                raise ValueError("empty file")
+            df = pd.json_normalize(records)
+            df.columns = [c.replace(".", "_") for c in df.columns]
+            con.register(view_name, df)
+            return
+
+    if isinstance(data, list):
+        if not data:
+            raise ValueError("empty array")
+        if all(isinstance(x, dict) for x in data):
+            df = pd.json_normalize(data)
+            df.columns = [c.replace(".", "_") for c in df.columns]
+        else:
+            # Scalar array
+            df = pd.DataFrame({"value": data})
+        con.register(view_name, df)
+        return
+
+    if isinstance(data, dict):
+        # Check for a single array-valued key containing dicts (like ipynb "cells")
+        array_keys = [k for k, v in data.items() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)]
+        if len(array_keys) == 1:
+            key = array_keys[0]
+            df = pd.json_normalize(data[key])
+            df.columns = [c.replace(".", "_") for c in df.columns]
+            con.register(view_name, df)
+            return
+
+        # Flatten the top-level object
+        flat = _flatten_dict(data)
+        rows = [{"key": k, "value": _collapse_str(v)} for k, v in flat.items()]
+        df = pd.DataFrame(rows)
+        con.register(view_name, df)
+        return
+
+    raise ValueError(f"unsupported JSON root type: {type(data).__name__}")
+
+
+def load_table(con, path, idx):
+    ext = os.path.splitext(path)[1].lower()
+    base = os.path.basename(path)
+    view_name = f"t{idx}"
+    if ext == ".parquet":
+        con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM '{path}'")
+    elif ext in TEXT_EXTENSIONS:
+        import pandas as pd
+        with open(path) as f:
+            lines = [line.rstrip("\n") for line in f]
+        df = pd.DataFrame({"line": lines})
+        con.register(view_name, df)
+    elif ext in JSON_EXTENSIONS:
+        load_json(con, path, view_name)
+    else:
+        con.execute(
+            f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_csv_auto('{path}')"
+        )
+    cols = [r[0] for r in con.execute(f"DESCRIBE {view_name}").fetchall()]
+    nrows = con.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()[0]
+    return base, view_name, cols, nrows
+
+
+def fetch_rows(con, view_name, offset, limit):
+    return con.execute(
+        f"SELECT * FROM {view_name} LIMIT {limit} OFFSET {offset}"
+    ).fetchall()
+
+
+def search_all(con, view_name, term):
+    rows = con.execute(f"SELECT * FROM {view_name}").fetchall()
+    return {i for i, r in enumerate(rows) if term.lower() in str(r).lower()}
+
+
+def compute_column_widths(cols, rows_sample, screen_w, min_w=4, max_w=40, sep=2):
+    ncols = len(cols)
+    if ncols == 0:
+        return []
+    if ncols == 1:
+        return [screen_w - 2]
+    widths = [min(len(str(c)), max_w) for c in cols]
+    for row in rows_sample[:100]:
+        for j, val in enumerate(row):
+            widths[j] = max(widths[j], min(len(str(val)), max_w))
+    total = sum(widths) + sep * (ncols - 1)
+    if total > screen_w:
+        scale = (screen_w - sep * (ncols - 1)) / sum(widths)
+        widths = [max(min_w, int(w * scale)) for w in widths]
+    return widths
+
+
+def cell_str(val, width):
+    if val is None:
+        return "NULL".ljust(width)
+    s = str(val)
+    s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    if len(s) > width:
+        return s[: width - 1] + ">"
+    return s.ljust(width)
+
+
+class Viewer:
+    def __init__(self, con, tables):
+        self.con = con
+        self.tables = tables  # list of (filename, view_name, cols, nrows)
+        self.idx = 0          # active table index
+        self.top = 0          # scroll position
+        self.col_off = 0      # horizontal scroll offset
+        self.search_term = ""
+        self.matches = set()
+        self.status_msg = ""
+        self.sql_mode = False
+        self.sql_history = []
+        self.search_history = []
+        self._hist_idx = -1
+
+    @property
+    def view_name(self):
+        return self.tables[self.idx][1]
+
+    @property
+    def cols(self):
+        return self.tables[self.idx][2]
+
+    @property
+    def nrows(self):
+        return self.tables[self.idx][3]
+
+    def do_search(self, term):
+        if not term:
+            return
+        self.search_term = term
+        self.matches = search_all(self.con, self.view_name, term)
+        if self.matches:
+            for m in sorted(self.matches):
+                if m >= self.top:
+                    self.top = m
+                    return
+            self.top = min(self.matches)
+        else:
+            self.status_msg = f"Pattern not found: {term}"
+
+    def next_match(self):
+        if not self.matches:
+            return
+        for m in sorted(self.matches):
+            if m > self.top:
+                self.top = m
+                return
+        self.top = min(self.matches)
+
+    def prev_match(self):
+        if not self.matches:
+            return
+        for m in reversed(sorted(self.matches)):
+            if m < self.top:
+                self.top = m
+                return
+        self.top = max(self.matches)
+
+    def run_sql(self, sql):
+        if not sql.strip():
+            self.status_msg = "(empty query)"
+            return
+        try:
+            result = self.con.sql(sql)
+            df = result.fetchdf()
+            new_name = f"sql{len(self.tables)}"
+            self.con.register(new_name, df)
+            self.tables.append(
+                (f"SQL: {sql[:60]}", new_name, df.columns.tolist(), len(df))
+            )
+            self.idx = len(self.tables) - 1
+            self.top = 0
+            self.col_off = 0
+            self.search_term = ""
+            self.matches = set()
+            self.status_msg = f"OK: {len(df)} rows, {len(df.columns)} cols"
+        except Exception as e:
+            self.status_msg = f"Error: {str(e)[:80]}"
+
+    def render(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        stdscr.clear()
+
+        tab_h = 1 if len(self.tables) > 1 else 0
+        header_h = 2 + tab_h
+        status_h = 1
+        avail = max(1, h - header_h - status_h)
+
+        rows_data = fetch_rows(self.con, self.view_name, self.top, avail)
+        col_widths = compute_column_widths(self.cols, rows_data, w)
+
+        # --- Tab bar ---
+        if len(self.tables) > 1:
+            x = 0
+            for i, (fname, _, _, _) in enumerate(self.tables):
+                label = f" {fname[:30]} "
+                attr = curses.A_REVERSE if i == self.idx else 0
+                try:
+                    stdscr.addstr(0, x, label[: w - x - 1], attr)
+                except curses.error:
+                    pass
+                x += len(label)
+            try:
+                stdscr.addstr(0, x, " " * (w - x - 1), curses.A_REVERSE if self.idx == 0 else 0)
+            except curses.error:
+                pass
+
+        # --- Info bar ---
+        y = tab_h
+        fname = self.tables[self.idx][0]
+        info = f" {fname}  [{self.nrows:,}r x {len(self.cols)}c] "
+        pos = f" {self.top + 1}-{min(self.top + avail, self.nrows):,}/{self.nrows:,} "
+        rw = len(pos)
+        lw = max(1, w - rw - 1)
+        try:
+            stdscr.addstr(y, 0, info[:lw].ljust(lw)[:lw], curses.A_REVERSE)
+            stdscr.addstr(y, lw, pos[:rw], curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        # --- Column headers ---
+        col_line = y + 1
+        x = 0
+        for j, col in enumerate(self.cols):
+            cw = col_widths[j]
+            if x >= w - 1:
+                break
+            try:
+                stdscr.addstr(col_line, x, cell_str(col, min(cw, w - x - 1)), curses.A_BOLD)
+            except curses.error:
+                pass
+            x += cw + 2
+
+        # --- Data rows ---
+        for i, row in enumerate(rows_data):
+            ry = col_line + 1 + i
+            if ry >= h - status_h:
+                break
+            abs_row = self.top + i
+            x = 0
+            for j, val in enumerate(row):
+                if x >= w - 1:
+                    break
+                cw = col_widths[j]
+                try:
+                    stdscr.addstr(ry, x, cell_str(val, min(cw, w - x - 1)))
+                except curses.error:
+                    pass
+                x += cw + 2
+
+            # Highlight matched rows
+            if abs_row in self.matches:
+                row_text = " ".join(cell_str(v, min(col_widths[k], 20)) for k, v in enumerate(row))[: w - 1]
+                try:
+                    stdscr.addstr(ry, 0, row_text, curses.A_STANDOUT)
+                except curses.error:
+                    pass
+
+            # Row number
+            rn = str(abs_row + 1)
+            try:
+                stdscr.addstr(ry, w - len(rn) - 1, rn, curses.A_DIM)
+            except curses.error:
+                pass
+
+        # --- Status bar ---
+        sy = h - 1
+        parts = []
+        if self.search_term:
+            parts.append(f"/{self.search_term}")
+            if self.matches:
+                sorted_m = sorted(self.matches)
+                if self.top in self.matches:
+                    idx = sorted_m.index(self.top) + 1
+                    parts.append(f"[match {idx}/{len(self.matches)}]")
+                else:
+                    parts.append(f"[{len(self.matches)} matches]")
+        else:
+            parts.append("q:quit  /:search  .:sql  G:end  g:top  Tab:next  h:help")
+        status = " | ".join(parts)[: w - 1]
+        try:
+            stdscr.addstr(sy, 0, status, curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        return avail
+
+
+def show_help(stdscr):
+    h, w = stdscr.getmaxyx()
+    lines = [
+        " DBLess — DuckDB Parquet/CSV Viewer (less-like) ",
+        "",
+        " NAVIGATION",
+        "  arrows / j k    scroll line",
+        "  Space / PgDn    page down",
+        "  b / PgUp        page up",
+        "  g / Home        go to top",
+        "  G / End         go to tail",
+        "",
+        " SEARCH",
+        "  /               enter search term (Enter to confirm)",
+        "  n               next match",
+        "  N               previous match",
+        "",
+        " SQL",
+        "  .               enter SQL query (Enter to run, Esc to cancel)",
+        "                   table names: t0, t1, ... (files in order)",
+        "                   e.g.  SELECT * FROM t0 WHERE sharpe_ratio > 0.3",
+        "",
+        " FILES",
+        "  Tab             next file",
+        "  t0 t1 ...       switch to file by index",
+        "",
+        " OTHER",
+        "  q               quit",
+        "  Ctrl+L          redraw screen",
+        "",
+        " Press any key to close help",
+    ]
+    stdscr.clear()
+    for i, line in enumerate(lines):
+        if i < h:
+            try:
+                stdscr.addstr(i, max(0, (w - len(line)) // 2), line[: w - 1])
+            except curses.error:
+                pass
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def get_input(stdscr, prompt_y, prompt, history=None):
+    """Read a line of input with editing and history. Returns string or '' on Esc."""
+    h, w = stdscr.getmaxyx()
+    curses.noecho()
+    curses.curs_set(1)
+
+    buf = []
+    pos = 0
+    hist_idx = -1
+    saved_before_history = []
+
+    def render():
+        stdscr.move(prompt_y, 0)
+        stdscr.clrtoeol()
+        try:
+            stdscr.addstr(prompt_y, 0, prompt, curses.A_REVERSE)
+            text = "".join(buf)
+            stdscr.addstr(prompt_y, len(prompt), text[: w - len(prompt) - 1])
+        except curses.error:
+            pass
+        stdscr.move(prompt_y, len(prompt) + pos)
+        stdscr.refresh()
+
+    render()
+    while True:
+        c = stdscr.getch()
+        if c == 27:
+            curses.noecho()
+            curses.curs_set(0)
+            return ""
+        if c in (10, 13):
+            break
+        if c == curses.KEY_UP:
+            if history and hist_idx < len(history) - 1:
+                if hist_idx == -1:
+                    saved_before_history = list(buf)
+                hist_idx += 1
+                buf = list(history[len(history) - 1 - hist_idx])
+                pos = len(buf)
+            render()
+            continue
+        if c == curses.KEY_DOWN:
+            if hist_idx >= 0:
+                hist_idx -= 1
+                if hist_idx == -1:
+                    buf = list(saved_before_history)
+                else:
+                    buf = list(history[len(history) - 1 - hist_idx])
+                pos = len(buf)
+            render()
+            continue
+        if c == curses.KEY_LEFT:
+            if pos > 0:
+                pos -= 1
+            render()
+            continue
+        if c == curses.KEY_RIGHT:
+            if pos < len(buf):
+                pos += 1
+            render()
+            continue
+        if c == curses.KEY_HOME:
+            pos = 0
+            render()
+            continue
+        if c == curses.KEY_END:
+            pos = len(buf)
+            render()
+            continue
+        if c in (curses.KEY_BACKSPACE, 127, 8):
+            if pos > 0:
+                buf.pop(pos - 1)
+                pos -= 1
+            hist_idx = -1
+            render()
+            continue
+        if c == curses.KEY_DC:
+            if pos < len(buf):
+                buf.pop(pos)
+            hist_idx = -1
+            render()
+            continue
+        if 32 <= c <= 126:
+            buf.insert(pos, chr(c))
+            pos += 1
+            hist_idx = -1
+            render()
+            continue
+        render()
+
+    curses.noecho()
+    curses.curs_set(0)
+    return "".join(buf)
+
+
+def run_app(stdscr, con, tables):
+    curses.use_default_colors()
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+
+    v = Viewer(con, tables)
+
+    while True:
+        avail = v.render(stdscr)
+        stdscr.refresh()
+
+        if v.sql_mode:
+            h, _ = stdscr.getmaxyx()
+            sql = get_input(stdscr, h - 1, "SQL> ", v.sql_history)
+            v.sql_mode = False
+            if sql.strip():
+                v.sql_history.append(sql)
+            v.run_sql(sql)
+            continue
+
+        if v.status_msg:
+            h, _ = stdscr.getmaxyx()
+            try:
+                stdscr.move(h - 1, 0)
+                stdscr.clrtoeol()
+                stdscr.addstr(h - 1, 0, v.status_msg[:79], curses.A_REVERSE)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            curses.napms(1500)
+            v.status_msg = ""
+
+        c = stdscr.getch()
+
+        if c in (ord("q"), ord("Q")):
+            break
+        elif c in (ord("h"), ord("H")):
+            show_help(stdscr)
+        elif c == ord("G"):
+            v.top = max(0, v.nrows - avail)
+        elif c in (ord("g"), curses.KEY_HOME):
+            v.top = 0
+        elif c == ord("/"):
+            h, _ = stdscr.getmaxyx()
+            term = get_input(stdscr, h - 1, "/", v.search_history).strip()
+            if term:
+                if not v.search_history or v.search_history[-1] != term:
+                    v.search_history.append(term)
+                v.do_search(term)
+            else:
+                v.next_match()
+        elif c == ord("n"):
+            v.next_match()
+        elif c == ord("N"):
+            v.prev_match()
+        elif c == ord("."):
+            v.sql_mode = True
+        elif c == ord("\t"):  # Tab
+            if len(v.tables) > 1:
+                v.idx = (v.idx + 1) % len(v.tables)
+                v.top = 0
+                v.col_off = 0
+                v.search_term = ""
+                v.matches = set()
+        elif c in (curses.KEY_DOWN, ord("j")):
+            v.top = min(v.top + 1, max(0, v.nrows - 1))
+        elif c in (curses.KEY_UP, ord("k")):
+            v.top = max(v.top - 1, 0)
+        elif c in (ord(" "), curses.KEY_NPAGE):
+            v.top = min(v.top + avail, max(0, v.nrows - avail))
+        elif c in (ord("b"), curses.KEY_PPAGE, 2):
+            v.top = max(v.top - avail, 0)
+        elif c == ord("\x0c"):  # Ctrl+L
+            stdscr.clear()
+        elif c == curses.KEY_END:
+            v.top = max(0, v.nrows - avail)
+        elif c in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            pass  # horizontal scroll placeholder
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Interactive viewer for CSV/Parquet files (less-like, DuckDB backend)"
+    )
+    parser.add_argument(
+        "files", nargs="+", metavar="FILE", help="CSV or Parquet files to view"
+    )
+    parser.add_argument(
+        "-n", "--rows", type=int, default=0, help="Page size (0 = auto-fit to terminal)"
+    )
+    args = parser.parse_args()
+
+    con = duckdb.connect()
+    tables = []
+    for i, path in enumerate(args.files):
+        if not os.path.exists(path):
+            print(f"dbless: {path}: No such file", file=sys.stderr)
+            sys.exit(1)
+        try:
+            tables.append(load_table(con, path, i))
+        except Exception as e:
+            print(f"dbless: {path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    curses.wrapper(run_app, con, tables)
+
+
+if __name__ == "__main__":
+    main()
