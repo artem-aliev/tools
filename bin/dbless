@@ -4,6 +4,7 @@
 Usage:
     dbless file.csv
     dbless file.parquet
+    dbless file.md
     dbless output/*.csv
     dbless -n 50 file.parquet
 
@@ -25,6 +26,7 @@ Keys:
 import argparse
 import curses
 import os
+import re
 import sys
 import duckdb
 
@@ -175,10 +177,180 @@ def cell_str(val, width):
     return s.ljust(width)
 
 
+def _format_md_line(line, screen_w):
+    """Return list of (text, attr) segments for a markdown line."""
+    # Heading
+    m = re.match(r'^(#{1,6})\s+(.+)$', line)
+    if m:
+        return [(line[:screen_w - 1], curses.A_BOLD)]
+
+    # Todo item: "- [x] task" or "- [ ] task"
+    m = re.match(r'^(\s*)- \[([ xX])\](.*)$', line)
+    if m:
+        indent, status, rest = m.group(1), m.group(2), m.group(3)
+        checked = status.strip().lower() == 'x'
+        done_mark = "[x]" if checked else "[ ]"
+        head = f"{indent}- "
+        segments = [(head, 0)]
+        segments.append((done_mark, curses.A_BOLD))
+        remain = rest[:screen_w - len(indent) - 6]
+        if remain:
+            segments.append((remain, 0))
+        return segments
+
+    # Code fence
+    if line.strip().startswith('```'):
+        return [(line[:screen_w - 1], curses.A_DIM)]
+
+    # Pipe table — handled via _render_table_row when col_widths is available
+    if line.strip().startswith('|'):
+        return [(line[:screen_w - 1], 0)]
+
+    # Blockquote
+    if line.strip().startswith('>'):
+        return [(line[:screen_w - 1], curses.A_DIM)]
+
+    # Horizontal rule
+    if re.match(r'^[-*_]{3,}\s*$', line):
+        return [(line[:screen_w - 1], curses.A_DIM)]
+
+    return [(line[:screen_w - 1], 0)]
+
+
+def _get_cells(line):
+    """Split a pipe-delimited markdown table row into cells."""
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|'):
+        s = s[:-1]
+    return [c.strip() for c in s.split('|')]
+
+
+def _compute_table_cols(lines):
+    """Compute column widths and alignments from a table's lines.
+    Returns (widths, aligns) where aligns is a list of 'l'/'c'/'r'."""
+    cells_list = [_get_cells(l) for l in lines]
+    ncols = max((len(c) for c in cells_list), default=0)
+
+    aligns = ['l'] * ncols
+    for cells in cells_list:
+        if cells and all(re.match(r'^[-:]+$', c) for c in cells):
+            for j, c in enumerate(cells):
+                if c.startswith(':') and c.endswith(':'):
+                    aligns[j] = 'c'
+                elif c.endswith(':'):
+                    aligns[j] = 'r'
+            break
+
+    widths = [3] * ncols
+    for cells in cells_list:
+        for j, cell in enumerate(cells):
+            widths[j] = max(widths[j], len(cell) + 2)
+
+    return widths, aligns[:ncols]
+
+
+def _build_md_table_map(con, view_name):
+    """Pre-compute column widths, alignments and position for every table row.
+    Returns dict: line_index -> (col_widths, aligns, is_first, is_last)."""
+    rows = con.execute(f"SELECT * FROM {view_name}").fetchall()
+    lines = [str(r[0]) for r in rows]
+    table_map = {}
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip().startswith('|'):
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and lines[i].strip().startswith('|'):
+            i += 1
+        end = i
+        col_widths, aligns = _compute_table_cols(lines[start:end])
+        for j in range(start, end):
+            table_map[j] = (col_widths, aligns, j == start, j == end - 1)
+    return table_map
+
+
+def _render_table_border(col_widths, style, screen_w):
+    """Return segments for a top or bottom table border."""
+    if style == 'top':
+        L, C, R = '\u250c', '\u252c', '\u2510'
+    else:
+        L, C, R = '\u2514', '\u2534', '\u2518'
+
+    segs = [(L, curses.A_DIM)]
+    for j, w in enumerate(col_widths):
+        segs.append(('\u2500' * w, curses.A_DIM))
+        if j < len(col_widths) - 1:
+            segs.append((C, curses.A_DIM))
+    segs.append((R, curses.A_DIM))
+
+    trimmed = []
+    cx = 0
+    for text, attr in segs:
+        if cx >= screen_w:
+            break
+        chunk = text[:screen_w - cx]
+        if trimmed and trimmed[-1][1] == attr:
+            trimmed[-1] = (trimmed[-1][0] + chunk, attr)
+        else:
+            trimmed.append((chunk, attr))
+        cx += len(chunk)
+    return trimmed
+
+
+def _render_table_row(line, col_widths, aligns, screen_w):
+    """Return list of (text, attr) for an aligned markdown table row."""
+    stripped = line.strip()
+    cells = _get_cells(stripped)
+    is_sep = bool(re.match(r'^\|[-: ]+(\|[-: ]+)*\|$', stripped))
+
+    L, C, R = ('\u251d', '\u253f', '\u2525') if is_sep else ('\u2502', '\u2502', '\u2502')
+
+    segs = [(L, curses.A_DIM)]
+    for j, cell in enumerate(cells):
+        if j >= len(col_widths):
+            break
+        w = col_widths[j]
+        if is_sep:
+            content = '\u2500' * w
+        elif j < len(aligns) and aligns[j] == 'r':
+            content = cell.rjust(w)
+        elif j < len(aligns) and aligns[j] == 'c':
+            content = cell.center(w)
+        else:
+            content = cell.ljust(w)
+        segs.append((content, curses.A_DIM if is_sep else 0))
+        if j < len(cells) - 1:
+            segs.append((C, curses.A_DIM))
+    segs.append((R, curses.A_DIM))
+
+    trimmed = []
+    cx = 0
+    for text, attr in segs:
+        if cx >= screen_w:
+            break
+        remain = screen_w - cx
+        chunk = text[:remain]
+        if trimmed and trimmed[-1][1] == attr:
+            trimmed[-1] = (trimmed[-1][0] + chunk, attr)
+        else:
+            trimmed.append((chunk, attr))
+        cx += len(chunk)
+    return trimmed
+
+
 class Viewer:
     def __init__(self, con, tables):
         self.con = con
         self.tables = tables  # list of (filename, view_name, cols, nrows)
+        self._md_set = {i for i, (fn, _, cols, _) in enumerate(tables)
+                        if fn.endswith('.md') and cols == ['line']}
+        self._md_table_map = {}
+        for i, (fn, vn, cols, _) in enumerate(tables):
+            if fn.endswith('.md') and cols == ['line']:
+                self._md_table_map[vn] = _build_md_table_map(con, vn)
         self.idx = 0          # active table index
         self.top = 0          # scroll position
         self.col_off = 0      # horizontal scroll offset
@@ -267,6 +439,8 @@ class Viewer:
         rows_data = fetch_rows(self.con, self.view_name, self.top, avail)
         col_widths = compute_column_widths(self.cols, rows_data, w)
 
+        is_md = self.idx in self._md_set
+
         # --- Tab bar ---
         if len(self.tables) > 1:
             x = 0
@@ -298,48 +472,116 @@ class Viewer:
 
         # --- Column headers ---
         col_line = y + 1
-        x = 0
-        for j, col in enumerate(self.cols):
-            cw = col_widths[j]
-            if x >= w - 1:
-                break
-            try:
-                stdscr.addstr(col_line, x, cell_str(col, min(cw, w - x - 1)), curses.A_BOLD)
-            except curses.error:
-                pass
-            x += cw + 2
-
-        # --- Data rows ---
-        for i, row in enumerate(rows_data):
-            ry = col_line + 1 + i
-            if ry >= h - status_h:
-                break
-            abs_row = self.top + i
+        if not is_md:
             x = 0
-            for j, val in enumerate(row):
+            for j, col in enumerate(self.cols):
+                cw = col_widths[j]
                 if x >= w - 1:
                     break
-                cw = col_widths[j]
                 try:
-                    stdscr.addstr(ry, x, cell_str(val, min(cw, w - x - 1)))
+                    stdscr.addstr(col_line, x, cell_str(col, min(cw, w - x - 1)), curses.A_BOLD)
                 except curses.error:
                     pass
                 x += cw + 2
 
-            # Highlight matched rows
-            if abs_row in self.matches:
-                row_text = " ".join(cell_str(v, min(col_widths[k], 20)) for k, v in enumerate(row))[: w - 1]
+        # --- Data rows ---
+        screen_y = col_line + 1
+        for i, row in enumerate(rows_data):
+            if screen_y >= h - status_h:
+                break
+            abs_row = self.top + i
+            matched = abs_row in self.matches
+
+            if is_md:
+                line = str(row[0])
+                tmap = self._md_table_map.get(self.view_name, {})
+                tcols = tmap.get(abs_row)
+                if tcols is not None:
+                    col_widths, aligns, is_first, is_last = tcols
+
+                    # Top border before first row of a table
+                    if is_first and screen_y > col_line:
+                        segs = _render_table_border(col_widths, 'top', w)
+                        cx2 = 0
+                        for text, attr in segs:
+                            try:
+                                stdscr.addstr(screen_y, cx2, text, attr)
+                            except curses.error:
+                                pass
+                            cx2 += len(text)
+                        screen_y += 1
+                        if screen_y >= h - status_h:
+                            break
+
+                    ry = screen_y
+                    segments = _render_table_row(line, col_widths, aligns, w)
+                    cx = 0
+                    for text, attr in segments:
+                        if matched:
+                            attr |= curses.A_STANDOUT
+                        try:
+                            stdscr.addstr(ry, cx, text, attr)
+                        except curses.error:
+                            pass
+                        cx += len(text)
+                    screen_y += 1
+
+                    # Row number
+                    rn = str(abs_row + 1)
+                    try:
+                        stdscr.addstr(ry, w - len(rn) - 1, rn, curses.A_DIM)
+                    except curses.error:
+                        pass
+
+                    # Bottom border after last row of a table
+                    if is_last and screen_y < h - status_h:
+                        segs = _render_table_border(col_widths, 'bottom', w)
+                        cx2 = 0
+                        for text, attr in segs:
+                            try:
+                                stdscr.addstr(screen_y, cx2, text, attr)
+                            except curses.error:
+                                pass
+                            cx2 += len(text)
+                        screen_y += 1
+                else:
+                    segments = _format_md_line(line, w)
+                    cx = 0
+                    for text, attr in segments:
+                        if matched:
+                            attr |= curses.A_STANDOUT
+                        try:
+                            stdscr.addstr(screen_y, cx, text, attr)
+                        except curses.error:
+                            pass
+                        cx += len(text)
+                    # Row number
+                    rn = str(abs_row + 1)
+                    try:
+                        stdscr.addstr(screen_y, w - len(rn) - 1, rn, curses.A_DIM)
+                    except curses.error:
+                        pass
+                    screen_y += 1
+            else:
+                x = 0
+                for j, val in enumerate(row):
+                    if x >= w - 1:
+                        break
+                    cw = col_widths[j]
+                    try:
+                        stdscr.addstr(screen_y, x, cell_str(val, min(cw, w - x - 1)),
+                                      curses.A_STANDOUT if matched else 0)
+                    except curses.error:
+                        pass
+                    x += cw + 2
+
+                # Row number
+                rn = str(abs_row + 1)
                 try:
-                    stdscr.addstr(ry, 0, row_text, curses.A_STANDOUT)
+                    stdscr.addstr(screen_y, w - len(rn) - 1, rn, curses.A_DIM)
                 except curses.error:
                     pass
-
-            # Row number
-            rn = str(abs_row + 1)
-            try:
-                stdscr.addstr(ry, w - len(rn) - 1, rn, curses.A_DIM)
-            except curses.error:
-                pass
+                screen_y += 1
 
         # --- Status bar ---
         sy = h - 1

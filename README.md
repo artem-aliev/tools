@@ -6,35 +6,36 @@ A collection of CLI tools.
 
 | Tool   | Description |
 |--------|-------------|
-| dbless | Interactive Parquet/CSV/JSON viewer using DuckDB (`less`-like) |
+| dbless | Interactive Parquet/CSV/JSON/Markdown viewer using DuckDB (`less`-like) |
 
 ## Install
 
-**Linux / macOS:**
-
 ```sh
+uv venv && uv pip install -r requirements.txt
 ./install.sh
 ```
 
-**Windows:**
-
-```batch
-install.bat
-```
-
-This installs dependencies via `pip --user` and copies the scripts to `~/.local/bin`.
+`install.sh` also works standalone via `pip --user` if you don't use uv.
 
 ## dbless
 
-Interactive terminal viewer for tabular data files — Parquet, CSV, JSON, JSONL, and plain text.
+Interactive terminal viewer for Parquet, CSV, JSON, JSONL, Markdown, and plain text files.
 
 ```
 Usage:
     dbless file.csv
     dbless file.parquet
+    dbless file.md
     dbless output/*.csv
-    dbless -n 50 file.parquet
 ```
+
+**Markdown support** — `.md` files get syntax-aware rendering:
+
+- Headings (`#`–`######`) are **bold**
+- Todo checkboxes (`- [x]` / `- [ ]`) highlighted
+- Pipe tables rendered with aligned columns and box-drawing frames
+- Numeric columns right-aligned (detected from `---:` separator)
+- Blockquotes (`>`), code fences (`` ``` ``), and horizontal rules styled dim
 
 **Navigation:**
 
