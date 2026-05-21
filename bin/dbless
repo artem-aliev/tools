@@ -358,6 +358,7 @@ class Viewer:
         self.matches = set()
         self.status_msg = ""
         self.sql_mode = False
+        self.sql_prefill = ""
         self.sql_history = []
         self.search_history = []
         self._hist_idx = -1
@@ -649,14 +650,14 @@ def show_help(stdscr):
     stdscr.getch()
 
 
-def get_input(stdscr, prompt_y, prompt, history=None):
+def get_input(stdscr, prompt_y, prompt, history=None, default=""):
     """Read a line of input with editing and history. Returns string or '' on Esc."""
     h, w = stdscr.getmaxyx()
     curses.noecho()
     curses.curs_set(1)
 
-    buf = []
-    pos = 0
+    buf = list(default)
+    pos = len(buf)
     hist_idx = -1
     saved_before_history = []
 
@@ -757,8 +758,9 @@ def run_app(stdscr, con, tables):
 
         if v.sql_mode:
             h, _ = stdscr.getmaxyx()
-            sql = get_input(stdscr, h - 1, "SQL> ", v.sql_history)
+            sql = get_input(stdscr, h - 1, "SQL> ", v.sql_history, v.sql_prefill)
             v.sql_mode = False
+            v.sql_prefill = ""
             if sql.strip():
                 v.sql_history.append(sql)
             v.run_sql(sql)
@@ -800,6 +802,7 @@ def run_app(stdscr, con, tables):
         elif c == ord("N"):
             v.prev_match()
         elif c == ord("."):
+            v.sql_prefill = f"from {v.view_name} select " + ", ".join(v.cols)
             v.sql_mode = True
         elif c == ord("\t"):  # Tab
             if len(v.tables) > 1:
