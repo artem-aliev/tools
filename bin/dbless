@@ -670,7 +670,7 @@ def get_input(stdscr, prompt_y, prompt, history=None, default=""):
             stdscr.addstr(prompt_y, len(prompt), text[: w - len(prompt) - 1])
         except curses.error:
             pass
-        stdscr.move(prompt_y, len(prompt) + pos)
+        stdscr.move(prompt_y, min(len(prompt) + pos, w - 1))
         stdscr.refresh()
 
     render()
