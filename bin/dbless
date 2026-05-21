@@ -658,19 +658,30 @@ def get_input(stdscr, prompt_y, prompt, history=None, default=""):
 
     buf = list(default)
     pos = len(buf)
+    scroll_off = 0
     hist_idx = -1
     saved_before_history = []
 
     def render():
+        nonlocal scroll_off
+        vis_w = w - len(prompt) - 1
+        if pos < scroll_off:
+            scroll_off = pos
+        elif pos >= scroll_off + vis_w:
+            scroll_off = pos - vis_w + 1
+        if scroll_off < 0:
+            scroll_off = 0
         stdscr.move(prompt_y, 0)
         stdscr.clrtoeol()
         try:
             stdscr.addstr(prompt_y, 0, prompt, curses.A_REVERSE)
             text = "".join(buf)
-            stdscr.addstr(prompt_y, len(prompt), text[: w - len(prompt) - 1])
+            stdscr.addstr(prompt_y, len(prompt), text[scroll_off:scroll_off + vis_w])
         except curses.error:
             pass
-        stdscr.move(prompt_y, min(len(prompt) + pos, w - 1))
+        screen_pos = len(prompt) + pos - scroll_off
+        if 0 <= screen_pos < w:
+            stdscr.move(prompt_y, screen_pos)
         stdscr.refresh()
 
     render()
