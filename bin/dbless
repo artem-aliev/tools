@@ -813,7 +813,7 @@ def run_app(stdscr, con, tables):
         elif c == ord("N"):
             v.prev_match()
         elif c == ord("."):
-            v.sql_prefill = f"from {v.view_name} select " + ", ".join(v.cols)
+            v.sql_prefill = f'from "{v.view_name}" select ' + ", ".join(f'"{c}"' for c in v.cols)
             v.sql_mode = True
         elif c == ord("\t"):  # Tab
             if len(v.tables) > 1:
