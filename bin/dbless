@@ -20,6 +20,7 @@ Keys:
     .                enter SQL query (Enter to run, Esc to cancel)
     Tab              switch to next file
     h                show help
+    v                open current file in vi / $EDITOR
     q                quit
 """
 
@@ -27,6 +28,7 @@ import argparse
 import curses
 import os
 import re
+import subprocess
 import sys
 import duckdb
 
@@ -342,9 +344,10 @@ def _render_table_row(line, col_widths, aligns, screen_w):
 
 
 class Viewer:
-    def __init__(self, con, tables):
+    def __init__(self, con, tables, file_paths=None):
         self.con = con
         self.tables = tables  # list of (filename, view_name, cols, nrows)
+        self.file_paths = file_paths or []  # full paths in same order as tables
         self._md_set = {i for i, (fn, _, cols, _) in enumerate(tables)
                         if fn.endswith('.md') and cols == ['line']}
         self._md_table_map = {}
@@ -597,7 +600,7 @@ class Viewer:
                 else:
                     parts.append(f"[{len(self.matches)} matches]")
         else:
-            parts.append("q:quit  /:search  .:sql  G:end  g:top  Tab:next  h:help")
+            parts.append("q:quit  v:vi  /:search  .:sql  g:top  G:end  Tab:next  h:help")
         status = " | ".join(parts)[: w - 1]
         try:
             stdscr.addstr(sy, 0, status, curses.A_REVERSE)
@@ -634,6 +637,7 @@ def show_help(stdscr):
         "  t0 t1 ...       switch to file by index",
         "",
         " OTHER",
+        "  v               open current file in vi / $EDITOR",
         "  q               quit",
         "  Ctrl+L          redraw screen",
         "",
@@ -647,7 +651,7 @@ def show_help(stdscr):
             except curses.error:
                 pass
     stdscr.refresh()
-    stdscr.getch()
+    stdscr.get_wch()
 
 
 def get_input(stdscr, prompt_y, prompt, history=None, default=""):
@@ -686,7 +690,8 @@ def get_input(stdscr, prompt_y, prompt, history=None, default=""):
 
     render()
     while True:
-        c = stdscr.getch()
+        c = stdscr.get_wch()
+        c = ord(c) if isinstance(c, str) else c
         if c == 27:
             curses.noecho()
             curses.curs_set(0)
@@ -743,7 +748,7 @@ def get_input(stdscr, prompt_y, prompt, history=None, default=""):
             hist_idx = -1
             render()
             continue
-        if 32 <= c <= 126:
+        if c >= 32:
             buf.insert(pos, chr(c))
             pos += 1
             hist_idx = -1
@@ -756,12 +761,12 @@ def get_input(stdscr, prompt_y, prompt, history=None, default=""):
     return "".join(buf)
 
 
-def run_app(stdscr, con, tables):
+def run_app(stdscr, con, tables, file_paths=None):
     curses.use_default_colors()
     curses.curs_set(0)
     stdscr.nodelay(False)
 
-    v = Viewer(con, tables)
+    v = Viewer(con, tables, file_paths)
 
     while True:
         avail = v.render(stdscr)
@@ -789,15 +794,24 @@ def run_app(stdscr, con, tables):
             curses.napms(1500)
             v.status_msg = ""
 
-        c = stdscr.getch()
+        c = stdscr.get_wch()
+        c = ord(c) if isinstance(c, str) else c
 
-        if c in (ord("q"), ord("Q")):
+        if c in (ord("q"), ord("Q"), ord("й"), ord("Й")):
             break
-        elif c in (ord("h"), ord("H")):
+        elif c in (ord("v"), ord("V"), ord("м"), ord("М")):
+            if v.file_paths:
+                editor = os.environ.get("EDITOR", "vi")
+                curses.def_prog_mode()
+                curses.endwin()
+                subprocess.call([editor, v.file_paths[v.idx]])
+                curses.reset_prog_mode()
+                curses.doupdate()
+        elif c in (ord("h"), ord("H"), ord("р"), ord("Р")):
             show_help(stdscr)
-        elif c == ord("G"):
+        elif c in (ord("G"), ord("П")):
             v.top = max(0, v.nrows - avail)
-        elif c in (ord("g"), curses.KEY_HOME):
+        elif c in (ord("g"), ord("п"), curses.KEY_HOME):
             v.top = 0
         elif c == ord("/"):
             h, _ = stdscr.getmaxyx()
@@ -808,11 +822,11 @@ def run_app(stdscr, con, tables):
                 v.do_search(term)
             else:
                 v.next_match()
-        elif c == ord("n"):
+        elif c == ord("n") or c == ord("т"):
             v.next_match()
-        elif c == ord("N"):
+        elif c == ord("N") or c == ord("Т"):
             v.prev_match()
-        elif c == ord("."):
+        elif c in (ord("."), ord("ю")):
             v.sql_prefill = f'from "{v.view_name}" select ' + ", ".join(f'"{c}"' for c in v.cols)
             v.sql_mode = True
         elif c == ord("\t"):  # Tab
@@ -822,13 +836,13 @@ def run_app(stdscr, con, tables):
                 v.col_off = 0
                 v.search_term = ""
                 v.matches = set()
-        elif c in (curses.KEY_DOWN, ord("j")):
+        elif c in (curses.KEY_DOWN, ord("j"), ord("о")):
             v.top = min(v.top + 1, max(0, v.nrows - 1))
-        elif c in (curses.KEY_UP, ord("k")):
+        elif c in (curses.KEY_UP, ord("k"), ord("л")):
             v.top = max(v.top - 1, 0)
         elif c in (ord(" "), curses.KEY_NPAGE):
             v.top = min(v.top + avail, max(0, v.nrows - avail))
-        elif c in (ord("b"), curses.KEY_PPAGE, 2):
+        elif c in (ord("b"), ord("и"), curses.KEY_PPAGE, 2):
             v.top = max(v.top - avail, 0)
         elif c == ord("\x0c"):  # Ctrl+L
             stdscr.clear()
@@ -862,7 +876,7 @@ def main():
             print(f"dbless: {path}: {e}", file=sys.stderr)
             sys.exit(1)
 
-    curses.wrapper(run_app, con, tables)
+    curses.wrapper(run_app, con, tables, args.files)
 
 
 if __name__ == "__main__":
